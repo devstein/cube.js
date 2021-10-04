@@ -1,5 +1,7 @@
-use crate::cluster::Cluster;
+use crate::cluster::{pick_worker_by_ids, Cluster};
 use crate::config::injection::DIService;
+use crate::config::ConfigObj;
+use crate::metastore::multi_index::MultiPartition;
 use crate::metastore::table::Table;
 use crate::metastore::{Column, ColumnType, IdRow, Index, Partition};
 use crate::queryplanner::optimizations::CubeQueryPlanner;
@@ -46,6 +48,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Cursor;
 use std::iter::FromIterator;
+use std::mem::take;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{instrument, Instrument};
@@ -565,12 +568,15 @@ impl ClusterSendExec {
         schema: SchemaRef,
         cluster: Arc<dyn Cluster>,
         serialized_plan: Arc<SerializedPlan>,
-        union_snapshots: Vec<Vec<IndexSnapshot>>,
+        union_snapshots: &[Vec<IndexSnapshot>],
         input_for_optimizations: Arc<dyn ExecutionPlan>,
         use_streaming: bool,
     ) -> Self {
-        let partitions = Self::logical_partitions(&union_snapshots);
-        let partitions = Self::assign_nodes(cluster.as_ref(), partitions);
+        let partitions = Self::distribute_to_workers(
+            cluster.config().as_ref(),
+            union_snapshots,
+            &serialized_plan.planning_meta().multi_part_subtree,
+        );
         Self {
             schema,
             partitions,
@@ -581,16 +587,46 @@ impl ClusterSendExec {
         }
     }
 
-    pub fn logical_partitions(snapshots: &[Vec<IndexSnapshot>]) -> Vec<Vec<IdRow<Partition>>> {
-        let to_multiply = snapshots
-            .iter()
-            .map(|union| {
-                union
-                    .iter()
-                    .flat_map(|index| index.partitions().iter().map(|p| p.partition().clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+    pub fn distribute_to_workers(
+        config: &dyn ConfigObj,
+        snapshots: &[Vec<IndexSnapshot>],
+        tree: &HashMap<u64, MultiPartition>,
+    ) -> Vec<(String, Vec<u64>)> {
+        let partitions = Self::logical_partitions(snapshots, tree);
+        Self::assign_nodes(config, partitions)
+    }
+
+    fn logical_partitions(
+        snapshots: &[Vec<IndexSnapshot>],
+        tree: &HashMap<u64, MultiPartition>,
+    ) -> Vec<Vec<IdRow<Partition>>> {
+        let mut to_multiply = Vec::new();
+        let mut multi_partitions = HashMap::<u64, Vec<_>>::new();
+        for union in snapshots.iter() {
+            let mut ordinary_partitions = Vec::new();
+            for index in union {
+                for p in &index.partitions {
+                    match p.partition.get_row().multi_partition_id() {
+                        Some(id) => multi_partitions
+                            .entry(id)
+                            .or_default()
+                            .push(p.partition.clone()),
+                        None => ordinary_partitions.push(p.partition.clone()),
+                    }
+                }
+            }
+            if !ordinary_partitions.is_empty() {
+                to_multiply.push(ordinary_partitions);
+            }
+        }
+        assert!(to_multiply.is_empty() || multi_partitions.is_empty(),
+                "invalid state during partition selection. to_multiply: {:?}, multi_partitions: {:?}, snapshots: {:?}",
+                to_multiply, multi_partitions, snapshots);
+        // Multi partitions define how we distribute joins. They may not be present, though.
+        if !multi_partitions.is_empty() {
+            return Self::distribute_multi_partitions(multi_partitions, tree);
+        }
+        // Ordinary partitions need to be duplicated on multiple machines.
         let partitions = to_multiply
             .into_iter()
             .multi_cartesian_product()
@@ -598,16 +634,57 @@ impl ClusterSendExec {
         partitions
     }
 
+    fn distribute_multi_partitions(
+        mut multi_partitions: HashMap<u64, Vec<IdRow<Partition>>>,
+        tree: &HashMap<u64, MultiPartition>,
+    ) -> Vec<Vec<IdRow<Partition>>> {
+        let mut has_children = HashSet::new();
+        for m in tree.values() {
+            if let Some(p) = m.parent_multi_partition_id() {
+                has_children.insert(p);
+            }
+        }
+        // Append partitions from ancestors to leaves.
+        let mut leaves = HashMap::new();
+        for (m, parts) in multi_partitions.iter_mut() {
+            if !has_children.contains(m) {
+                continue;
+            }
+            leaves.insert(*m, take(parts));
+        }
+
+        for (m, parts) in leaves.iter_mut() {
+            let mut curr = tree[m].parent_multi_partition_id();
+            while let Some(p) = curr {
+                if let Some(ps) = multi_partitions.get(&p) {
+                    parts.extend_from_slice(ps)
+                }
+                curr = tree[&p].parent_multi_partition_id();
+            }
+        }
+
+        let mut r = Vec::new();
+        for (m, parts) in multi_partitions {
+            if has_children.contains(&m) {
+                continue;
+            }
+            r.push(parts)
+        }
+        r
+    }
+
     fn assign_nodes(
-        c: &dyn Cluster,
+        c: &dyn ConfigObj,
         logical: Vec<Vec<IdRow<Partition>>>,
     ) -> Vec<(String, Vec<u64>)> {
         let mut m: HashMap<String, Vec<u64>> = HashMap::new();
         for ps in &logical {
             let ids = ps.iter().map(|p| p.get_id()).collect_vec();
-            m.entry(c.node_name_by_partitions(&ids))
-                .or_default()
-                .extend(ids)
+            let node = match ps[0].get_row().multi_partition_id() {
+                Some(multi_id) => pick_worker_by_ids(c, &[multi_id]),
+                None => pick_worker_by_ids(c, &ids),
+            };
+            m.entry(node.to_string()).or_default().extend(ids)
         }
 
         let mut r = m.into_iter().collect_vec();

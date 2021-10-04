@@ -1,6 +1,6 @@
 use crate::metastore::table::{Table, TablePath};
 use crate::metastore::{Chunk, IdRow, Index, Partition};
-use crate::queryplanner::planning::ClusterSendNode;
+use crate::queryplanner::planning::{ClusterSendNode, PlanningMeta};
 use crate::queryplanner::query_executor::CubeTable;
 use crate::queryplanner::topk::{ClusterAggregateTopK, SortColumn};
 use crate::queryplanner::udfs::aggregate_udf_by_kind;
@@ -36,7 +36,7 @@ pub struct SerializedPlan {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SchemaSnapshot {
-    index_snapshots: Vec<IndexSnapshot>,
+    index_snapshots: PlanningMeta,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -596,7 +596,7 @@ pub enum SerializedTableSource {
 impl SerializedPlan {
     pub async fn try_new(
         plan: LogicalPlan,
-        index_snapshots: Vec<IndexSnapshot>,
+        index_snapshots: PlanningMeta,
     ) -> Result<Self, CubeError> {
         let serialized_logical_plan = Self::serialized_logical_plan(&plan);
         Ok(SerializedPlan {
@@ -627,6 +627,10 @@ impl SerializedPlan {
     }
 
     pub fn index_snapshots(&self) -> &Vec<IndexSnapshot> {
+        &self.schema_snapshot.index_snapshots.indices
+    }
+
+    pub fn planning_meta(&self) -> &PlanningMeta {
         &self.schema_snapshot.index_snapshots
     }
 

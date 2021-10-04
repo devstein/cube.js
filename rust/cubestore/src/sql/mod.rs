@@ -40,6 +40,7 @@ use crate::config::injection::DIService;
 use crate::import::limits::ConcurrencyLimits;
 use crate::import::Ingestion;
 use crate::metastore::job::JobType;
+use crate::metastore::multi_index::MultiIndex;
 use crate::metastore::{
     is_valid_plain_binary_hll, table::Table, HllFlavour, IdRow, ImportFormat, Index, IndexDef,
     MetaStoreTable, RowKey, Schema, TableId,
@@ -48,7 +49,7 @@ use crate::queryplanner::query_executor::{batch_to_dataframe, QueryExecutor};
 use crate::queryplanner::{QueryPlan, QueryPlanner};
 use crate::remotefs::RemoteFs;
 use crate::sql::cache::SqlResultCache;
-use crate::sql::parser::CubeStoreParser;
+use crate::sql::parser::{CubeStoreParser, PartitionedIndexRef};
 use crate::store::ChunkDataStore;
 use crate::table::{data, Row, TableValue, TimestampValue};
 use crate::util::decimal::Decimal;
@@ -60,6 +61,7 @@ use crate::{
     store::DataFrame,
 };
 use data::create_array_builder;
+use std::mem::take;
 
 pub mod cache;
 pub(crate) mod parser;
@@ -155,13 +157,43 @@ impl SqlServiceImpl {
         external: bool,
         locations: Option<Vec<String>>,
         indexes: Vec<Statement>,
+        partitioned_index: Option<PartitionedIndexRef>,
     ) -> Result<IdRow<Table>, CubeError> {
         let columns_to_set = convert_columns_type(columns)?;
         let mut indexes_to_create = Vec::new();
+        if let Some(mut p) = partitioned_index {
+            let part_index_name = match p.name.0.as_mut_slice() {
+                &mut [ref schema, ref mut name] => {
+                    if schema.value != schema_name {
+                        return Err(CubeError::user(format!("CREATE TABLE in schema '{}' cannot reference PARTITIONED INDEX from schema '{}'", schema_name, schema)));
+                    }
+                    take(&mut name.value)
+                }
+                &mut [ref mut name] => take(&mut name.value),
+                _ => {
+                    return Err(CubeError::user(format!(
+                        "PARTITIONED INDEX must consist of 1 or 2 identifiers, got '{}'",
+                        p.name
+                    )))
+                }
+            };
+
+            let mut columns = Vec::new();
+            for mut c in p.columns {
+                columns.push(take(&mut c.value));
+            }
+
+            indexes_to_create.push(IndexDef {
+                name: "#mi0".to_string(),
+                columns,
+                multi_index: Some(part_index_name),
+            });
+        }
         for index in indexes.iter() {
             if let Statement::CreateIndex { name, columns, .. } = index {
                 indexes_to_create.push(IndexDef {
                     name: name.to_string(),
+                    multi_index: None,
                     columns: columns
                         .iter()
                         .map(|c| {
@@ -219,6 +251,18 @@ impl SqlServiceImpl {
             return Err(e);
         }
         Ok(table)
+    }
+
+    async fn create_partitioned_index(
+        &self,
+        schema: String,
+        name: String,
+        columns: Vec<ColumnDef>,
+    ) -> Result<IdRow<MultiIndex>, CubeError> {
+        let columns = convert_columns_type(&columns)?;
+        self.db
+            .create_partitioned_index(schema, name, columns)
+            .await
     }
 
     async fn finalize_external_table(
@@ -279,6 +323,7 @@ impl SqlServiceImpl {
                 table_name,
                 IndexDef {
                     name,
+                    multi_index: None,
                     columns: columns.iter().map(|c| c.value.to_string()).collect(),
                 },
             )
@@ -480,6 +525,7 @@ impl SqlService for SqlServiceImpl {
                     },
                 indexes,
                 locations,
+                partitioned_index,
             } => {
                 let nv = &name.0;
                 if nv.len() != 2 {
@@ -499,6 +545,7 @@ impl SqlService for SqlServiceImpl {
                         external,
                         locations,
                         indexes,
+                        partitioned_index,
                     )
                     .await?;
                 Ok(Arc::new(DataFrame::from(vec![res])))
@@ -536,6 +583,24 @@ impl SqlService for SqlServiceImpl {
                             })
                             .collect::<Result<Vec<_>, _>>()?,
                     )
+                    .await?;
+                Ok(Arc::new(DataFrame::from(vec![res])))
+            }
+            CubeStoreStatement::Statement(Statement::CreatePartitionedIndex {
+                name,
+                columns,
+                if_not_exists: _, // TODO: take if_not_exists into account.
+            }) => {
+                if name.0.len() != 2 {
+                    return Err(CubeError::user(format!(
+                        "Expected name for PARTITIONED INDEX in the form '<SCHEMA>.<INDEX>', found: {}",
+                        name
+                    )));
+                }
+                let schema = &name.0[0].value;
+                let index = &name.0[1].value;
+                let res = self
+                    .create_partitioned_index(schema.to_string(), index.to_string(), columns)
                     .await?;
                 Ok(Arc::new(DataFrame::from(vec![res])))
             }
@@ -594,7 +659,7 @@ impl SqlService for SqlServiceImpl {
                         app_metrics::META_QUERIES.increment();
                         Arc::new(self.query_planner.execute_meta_plan(logical_plan).await?)
                     }
-                    QueryPlan::Select(serialized, partitions) => {
+                    QueryPlan::Select(serialized, workers) => {
                         app_metrics::DATA_QUERIES.increment();
                         let cluster = self.cluster.clone();
                         let executor = self.query_executor.clone();
@@ -603,15 +668,13 @@ impl SqlService for SqlServiceImpl {
                             self.cache
                                 .get(query, serialized, async move |plan| {
                                     let records;
-                                    if partitions.len() == 0 {
+                                    if workers.len() == 0 {
                                         records =
                                             executor.execute_router_plan(plan, cluster).await?.1;
                                     } else {
                                         // Pick one of the workers to run as main for the request.
-                                        let i =
-                                            thread_rng().sample(Uniform::new(0, partitions.len()));
-                                        let node = cluster.node_name_by_partitions(&partitions[i]);
-                                        let rs = cluster.route_select(&node, plan).await?.1;
+                                        let i = thread_rng().sample(Uniform::new(0, workers.len()));
+                                        let rs = cluster.route_select(&workers[i], plan).await?.1;
                                         records = rs
                                             .into_iter()
                                             .map(|r| r.read())
@@ -1181,7 +1244,7 @@ mod tests {
     use crate::store::ChunkStore;
 
     use super::*;
-    use crate::table::data::{cmp_row_key_heap, cmp_row_markers};
+    use crate::table::data::{cmp_min_rows, cmp_row_key_heap};
 
     #[tokio::test]
     async fn create_schema_test() {
@@ -1925,14 +1988,13 @@ mod tests {
                 "INSERT INTO foo.table (t) VALUES (NULL), (NULL), (NULL), (2), (4), (5), (27), (28), (29)"
             ).await.unwrap();
 
-            listener.wait_for_job_results(vec![
+            let wait = listener.wait_for_job_results(vec![
                 (RowKey::Table(TableId::Partitions, 1), JobType::PartitionCompaction),
                 (RowKey::Table(TableId::Partitions, 2), JobType::PartitionCompaction),
                 (RowKey::Table(TableId::Partitions, 3), JobType::PartitionCompaction),
                 (RowKey::Table(TableId::Partitions, 1), JobType::Repartition),
-                (RowKey::Table(TableId::Partitions, 2), JobType::Repartition),
-                (RowKey::Table(TableId::Partitions, 3), JobType::Repartition),
-            ]).await.unwrap();
+            ]);
+            timeout(Duration::from_secs(10), wait).await.unwrap().unwrap();
 
             let partitions = services.meta_store.get_active_partitions_by_index_id(1).await.unwrap();
 
@@ -1946,14 +2008,14 @@ mod tests {
             let mut intervals_set = new_partitions.into_iter()
                 .map(|p| (p.get_row().get_min_val().clone(), p.get_row().get_max_val().clone()))
                 .collect::<Vec<_>>();
-            intervals_set.sort_by(|(min_a, _), (min_b, _)| cmp_row_markers(1, min_a, min_b));
+            intervals_set.sort_by(|(min_a, _), (min_b, _)| cmp_min_rows(1, min_a.as_ref(), min_b.as_ref()));
             let mut expected = vec![
                 (None, Some(Row::new(vec![TableValue::Int(2)]))),
                 (Some(Row::new(vec![TableValue::Int(2)])), Some(Row::new(vec![TableValue::Int(10)]))),
                 (Some(Row::new(vec![TableValue::Int(10)])), Some(Row::new(vec![TableValue::Int(27)]))),
                 (Some(Row::new(vec![TableValue::Int(27)])), None),
             ].into_iter().collect::<Vec<_>>();
-            expected.sort_by(|(min_a, _), (min_b, _)| cmp_row_markers(1, min_a, min_b));
+            expected.sort_by(|(min_a, _), (min_b, _)| cmp_min_rows(1, min_a.as_ref(), min_b.as_ref()));
             assert_eq!(intervals_set, expected);
 
             let result = service.exec_query("SELECT count(*) from foo.table").await.unwrap();
