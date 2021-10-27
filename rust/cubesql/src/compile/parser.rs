@@ -16,6 +16,7 @@ impl Dialect for MySqlDialectWithBackTicks {
             || (ch >= 'A' && ch <= 'Z')
             || ch == '_'
             || ch == '$'
+            || ch == '@'
             || (ch >= '\u{0080}' && ch <= '\u{ffff}')
     }
 

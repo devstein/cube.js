@@ -22,18 +22,21 @@ use datafusion::prelude::DataFrame as DFDataFrame;
 
 use datafusion::prelude::ExecutionContext;
 
+use datafusion::variable::VarType;
 use log::debug;
 use log::error;
 use log::trace;
 
 use msql_srv::*;
 
+use serde_json::json;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, RwLock};
 
 use crate::compile::convert_sql_to_cube_query;
 use crate::compile::convert_statement_to_cube_query;
+use crate::compile::engine::context::SystemVar;
 use crate::compile::parser::MySqlDialectWithBackTicks;
 use crate::config::processing_loop::ProcessingLoop;
 use crate::schema::SchemaService;
@@ -627,73 +630,70 @@ impl Backend {
                 .await?;
 
             let plan = convert_sql_to_cube_query(&query, Arc::new(ctx))?;
-            match &plan {
+            match plan {
                 crate::compile::QueryPlan::DataFushionSelect(plan) => {
-                    let ctx = ExecutionContext::new();
+                    let mut ctx = ExecutionContext::new();
+
+                    let variable_provider = SystemVar::new();
+                    ctx.register_variable(VarType::System, Arc::new(variable_provider));
+
                     let df = DataFrameImpl::new(
                         ctx.state,
-                        plan,
+                        &plan,
                     );
                     let batches = df.collect().await?;
                     println!("{:?}", batches);
 
                     let response =  batch_to_dataframe(&batches)?;
-                    return Ok(Arc::new(response));
+                    return Ok(Arc::new(response))
                 },
-                _ => {}
-            };
+                crate::compile::QueryPlan::CubeSelect(plan) => {
+                    debug!("Request {}", json!(plan.request).to_string());
+                    debug!("Meta {:?}", plan.meta);
 
-            // debug!("Request {}", json!(compiled_query.request).to_string());
-            // debug!("Meta {:?}", compiled_query.meta);
+                    let response = self.schema
+                        .request(plan.request, auth_ctx)
+                        .await?;
 
-            // let response = self.schema
-            //     .request(compiled_query.request, auth_ctx)
-            //     .await?;
+                    let mut columns: Vec<dataframe::Column> = vec![];
 
-            // let mut columns: Vec<dataframe::Column> = vec![];
+                    for column_meta in &plan.meta {
+                        columns.push(dataframe::Column::new(
+                            column_meta.column_to.clone(),
+                            column_meta.column_type
+                        ));
+                    }
 
-            // for column_meta in &compiled_query.meta {
-            //     columns.push(dataframe::Column::new(
-            //         column_meta.column_to.clone(),
-            //         column_meta.column_type
-            //     ));
-            // }
+                    let mut rows: Vec<dataframe::Row> = vec![];
 
-            // let mut rows: Vec<dataframe::Row> = vec![];
+                    if let Some(result) = response.results.first() {
+                        debug!("Columns {:?}", columns);
+                        debug!("Hydration mapping {:?}", plan.meta);
+                        trace!("Response from Cube.js {:?}", result.data);
 
-            // if let Some(result) = response.results.first() {
-            //     debug!("Columns {:?}", columns);
-            //     debug!("Hydration mapping {:?}", compiled_query.meta);
-            //     trace!("Response from Cube.js {:?}", result.data);
+                        for row in result.data.iter() {
+                            if let Some(record) = row.as_object() {
+                                rows.push(
+                                    dataframe::Row::hydrate_from_response(&plan.meta, record)
+                                );
+                            } else {
+                                error!(
+                                    "Unable to map row to DataFrame::Row: {:?}, skipping row",
+                                    row
+                                );
+                            }
+                        }
 
-            //     for row in result.data.iter() {
-            //         if let Some(record) = row.as_object() {
-            //             rows.push(
-            //                 Row::hydrate_from_response(&compiled_query.meta, record)
-            //             );
-            //         } else {
-            //             error!(
-            //                 "Unable to map row to DataFrame::Row: {:?}, skipping row",
-            //                 row
-            //             );
-            //         }
-            //     }
-
-            //     return Ok(Arc::new(DataFrame::new(
-            //         columns,
-            //         rows
-            //     )))
-            // }
-
+                        return Ok(Arc::new(dataframe::DataFrame::new(
+                            columns,
+                            rows
+                        )));
+                    } else {
+                        return Ok(Arc::new(dataframe::DataFrame::new(vec![], vec![])));
+                    }
+                }
+            }
         }
-
-        // if start.elapsed().unwrap().as_millis() > 200 && query_lower.starts_with("select") {
-        //     warn!(
-        //         "Slow Query SQL ({:?}):\n{}",
-        //         start.elapsed().unwrap(),
-        //         query
-        //     );
-        // }
 
         if ignore {
             Ok(Arc::new(dataframe::DataFrame::new(vec![], vec![])))

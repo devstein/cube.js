@@ -31,6 +31,7 @@ use self::context::*;
 pub mod builder;
 pub mod context;
 pub mod parser;
+pub mod engine;
 
 #[derive(Debug, PartialEq)]
 pub enum CompilationError {
