@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::{backtrace::Backtrace, fmt};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::util::pretty::print_batches;
+
+
 use datafusion::{logical_plan::LogicalPlan, prelude::*};
 use log::{debug, trace};
 use serde::Serialize;
@@ -1054,7 +1054,7 @@ impl QueryPlanner {
                         // `KibanaSampleDataEcommerce`
                         ("db".to_string(), identifiers[0].value.clone())
                     } else {
-                        let mut ctx = ExecutionContext::new();
+                        let ctx = ExecutionContext::new();
                         let plan = ctx.create_logical_plan(&q.to_string()).map_err(|err| {
                             CompilationError::Internal(format!("Planning error: {}", err))
                         })?;
@@ -1081,7 +1081,7 @@ impl QueryPlanner {
         if let Some(cube) = self.context.find_cube_with_name(table_name.clone()) {
             // println!("{:?}", select.projection);
             let mut ctx = QueryContext::new(&cube);
-            let mut builder = compile_select(&select, &mut ctx)?;
+            let mut builder = compile_select(select, &mut ctx)?;
 
             if let Some(limit_expr) = &q.limit {
                 let limit = limit_expr.to_string().parse::<i32>().map_err(|e| {

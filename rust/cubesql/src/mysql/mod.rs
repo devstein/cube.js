@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use datafusion::arrow::array::Array;
-use datafusion::arrow::array::BinaryArray;
+
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::array::Float64Array;
 use datafusion::arrow::array::Int64Array;
@@ -19,7 +19,7 @@ use datafusion::arrow::datatypes::TimeUnit;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::dataframe_impl::DataFrameImpl;
 use datafusion::prelude::DataFrame as DFDataFrame;
-use datafusion::prelude::ExecutionConfig;
+
 use datafusion::prelude::ExecutionContext;
 
 use log::debug;
@@ -28,7 +28,7 @@ use log::trace;
 
 use msql_srv::*;
 
-use serde_json::json;
+
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
@@ -96,9 +96,9 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<dataframe::DataF
     let mut all_rows = vec![];
 
     for batch in batches.iter() {
-        if cols.len() == 0 {
+        if cols.is_empty() {
             let schema = batch.schema().clone();
-            for (i, field) in schema.fields().iter().enumerate() {
+            for (_i, field) in schema.fields().iter().enumerate() {
                 cols.push(dataframe::Column::new(
                     field.name().clone(),
                     arrow_to_column_type(field.data_type().clone())?,
@@ -127,7 +127,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<dataframe::DataF
                             dataframe::TableValue::Null
                         } else {
                             let decimal = a.value(i) as f64;
-                            dataframe::TableValue::Float64(decimal.into())
+                            dataframe::TableValue::Float64(decimal)
                         });
                     }
                 }
@@ -151,7 +151,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<dataframe::DataF
                             dataframe::TableValue::Null
                         } else {
                             dataframe::TableValue::Timestamp(dataframe::TimestampValue::new(
-                                a.value(i) * 1000 as i64,
+                                a.value(i) * 1000_i64,
                             ))
                         });
                     }
@@ -632,7 +632,7 @@ impl Backend {
                     let ctx = ExecutionContext::new();
                     let df = DataFrameImpl::new(
                         ctx.state,
-                        &plan,
+                        plan,
                     );
                     let batches = df.collect().await?;
                     println!("{:?}", batches);
