@@ -1,3 +1,6 @@
+use std::fmt::{self, Debug, Formatter};
+
+use chrono::{SecondsFormat, TimeZone, Utc};
 use log::{error, warn};
 use msql_srv::ColumnType;
 
@@ -39,6 +42,10 @@ impl Row {
 
     pub fn values(&self) -> &Vec<TableValue> {
         &self.values
+    }
+
+    pub fn push(&mut self, val: TableValue) {
+        self.values.push(val);
     }
 
     pub fn hydrate_from_response(
@@ -146,6 +153,7 @@ pub enum TableValue {
     Int64(i64),
     Boolean(bool),
     Float64(f64),
+    Timestamp(TimestampValue),
 }
 
 pub struct DataFrame {
@@ -176,6 +184,40 @@ impl DataFrame {
 
     pub fn into_rows(self) -> Vec<Row> {
         self.data
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TimestampValue {
+    unix_nano: i64,
+}
+
+impl TimestampValue {
+    pub fn new(mut unix_nano: i64) -> TimestampValue {
+        // This is a hack to workaround a mismatch between on-disk and in-memory representations.
+        // We use millisecond precision on-disk.
+        unix_nano -= unix_nano % 1000;
+        TimestampValue { unix_nano }
+    }
+
+    pub fn get_time_stamp(&self) -> i64 {
+        self.unix_nano
+    }
+}
+
+impl Debug for TimestampValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TimestampValue")
+            .field("unix_nano", &self.unix_nano)
+            .field("str", &self.to_string())
+            .finish()
+    }
+}
+
+impl ToString for TimestampValue {
+    fn to_string(&self) -> String {
+        Utc.timestamp_nanos(self.unix_nano)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
     }
 }
 

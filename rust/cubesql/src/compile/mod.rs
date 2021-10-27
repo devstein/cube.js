@@ -1,6 +1,10 @@
+use std::sync::Arc;
 use std::{backtrace::Backtrace, fmt};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::util::pretty::print_batches;
+use datafusion::{logical_plan::LogicalPlan, prelude::*};
 use log::{debug, trace};
 use serde::Serialize;
 use serde_json::json;
@@ -13,6 +17,7 @@ use cubeclient::models::{
 };
 
 pub use crate::schema::ctx::*;
+use crate::CubeError;
 use crate::{
     compile::builder::QueryBuilder,
     schema::{ctx, V1CubeMetaDimensionExt, V1CubeMetaMeasureExt, V1CubeMetaSegmentExt},
@@ -964,124 +969,165 @@ fn compile_select(expr: &ast::Select, ctx: &mut QueryContext) -> CompilationResu
     Ok(builder)
 }
 
-fn compile_table_factor(expr: &ast::TableFactor) -> CompilationResult<String> {
-    match expr {
-        ast::TableFactor::Table { name, .. } => match name {
-            ast::ObjectName(identifiers) => {
-                // db.`KibanaSampleDataEcommerce`
-                if identifiers.len() == 2 {
-                    Ok(identifiers[1].value.clone())
-                } else if identifiers.len() == 1 {
-                    Ok(identifiers[0].value.clone())
-                } else {
-                    Err(CompilationError::Unsupported(format!(
-                        "table name: {:?}",
-                        name
-                    )))
+struct QueryPlanner {
+    context: Arc<ctx::TenantContext>,
+}
+
+impl QueryPlanner {
+    pub fn new(context: Arc<ctx::TenantContext>) -> Self {
+        Self { context }
+    }
+
+    pub fn plan(&self, stmt: &ast::Statement) -> CompilationResult<QueryPlan> {
+        match stmt {
+            ast::Statement::Query(q) => {
+                if q.with.is_some() {
+                    return Err(CompilationError::Unsupported(
+                        "Query with CTE instruction(s)".to_string(),
+                    ));
+                }
+
+                match &q.body {
+                    sqlparser::ast::SetExpr::Select(select) => self.plan_select(q, select),
+                    _ => Err(CompilationError::Unsupported(
+                        "Unsupported Query".to_string(),
+                    )),
                 }
             }
-        },
-        factor => Err(CompilationError::Unsupported(format!(
-            "table factor: {:?}",
-            factor
-        ))),
+            _ => Err(CompilationError::Unsupported(
+                "Unsupported query type".to_string(),
+            )),
+        }
+    }
+
+    fn plan_select(
+        &self,
+        q: &Box<ast::Query>,
+        select: &Box<ast::Select>,
+    ) -> CompilationResult<QueryPlan> {
+        if !select.cluster_by.is_empty() {
+            return Err(CompilationError::Unsupported(
+                "Query with CLUSTER BY instruction(s)".to_string(),
+            ));
+        }
+
+        if !select.distribute_by.is_empty() {
+            return Err(CompilationError::Unsupported(
+                "Query with DISTRIBUTE BY instruction(s)".to_string(),
+            ));
+        }
+
+        if select.having.is_some() {
+            return Err(CompilationError::Unsupported(
+                "Query with HAVING instruction(s)".to_string(),
+            ));
+        }
+
+        let from_table = if select.from.len() == 1 {
+            if !select.from[0].joins.is_empty() {
+                return Err(CompilationError::Unsupported(
+                    "Query with JOIN instruction(s)".to_string(),
+                ));
+            }
+
+            &select.from[0]
+        } else {
+            let ctx = ExecutionContext::new();
+            let plan = ctx.create_logical_plan(&q.to_string()).map_err(|err| {
+                CompilationError::Internal(format!("Initial planning error: {}", err))
+            })?;
+
+            let optimized_plan = ctx.optimize(&plan).map_err(|err| {
+                CompilationError::Internal(format!("Planning optimization error: {}", err))
+            })?;
+
+            return Ok(QueryPlan::DataFushionSelect(optimized_plan));
+        };
+
+        let (schema_name, table_name) = match &from_table.relation {
+            ast::TableFactor::Table { name, .. } => match name {
+                ast::ObjectName(identifiers) => {
+                    if identifiers.len() == 2 {
+                        // db.`KibanaSampleDataEcommerce`
+                        (identifiers[0].value.clone(), identifiers[1].value.clone())
+                    } else if identifiers.len() == 1 {
+                        // `KibanaSampleDataEcommerce`
+                        ("db".to_string(), identifiers[0].value.clone())
+                    } else {
+                        let mut ctx = ExecutionContext::new();
+                        let plan = ctx.create_logical_plan(&q.to_string()).map_err(|err| {
+                            CompilationError::Internal(format!("Planning error: {}", err))
+                        })?;
+
+                        return Ok(QueryPlan::DataFushionSelect(plan));
+                    }
+                }
+            },
+            factor => {
+                return Err(CompilationError::Unsupported(format!(
+                    "table factor: {:?}",
+                    factor
+                )));
+            }
+        };
+
+        if schema_name.to_lowercase() != "db" {
+            return Err(CompilationError::Unsupported(format!(
+                "Unable to access schema {}",
+                schema_name
+            )));
+        }
+
+        if let Some(cube) = self.context.find_cube_with_name(table_name.clone()) {
+            // println!("{:?}", select.projection);
+            let mut ctx = QueryContext::new(&cube);
+            let mut builder = compile_select(&select, &mut ctx)?;
+
+            if let Some(limit_expr) = &q.limit {
+                let limit = limit_expr.to_string().parse::<i32>().map_err(|e| {
+                    CompilationError::Unsupported(format!(
+                        "Unable to parse limit: {}",
+                        e.to_string()
+                    ))
+                })?;
+
+                builder.with_limit(limit);
+            }
+
+            if let Some(offset_expr) = &q.offset {
+                let offset = offset_expr.value.to_string().parse::<i32>().map_err(|e| {
+                    CompilationError::Unsupported(format!(
+                        "Unable to parse offset: {}",
+                        e.to_string()
+                    ))
+                })?;
+
+                builder.with_offset(offset);
+            }
+
+            compile_group(&select.group_by, &ctx, &mut builder)?;
+            compile_order(&q.order_by, &ctx, &mut builder)?;
+
+            if let Some(selection) = &select.selection {
+                compile_where(selection, &ctx, &mut builder)?;
+            }
+
+            Ok(QueryPlan::CubeSelect(builder.build()))
+        } else {
+            return Err(CompilationError::Unknown(format!(
+                "Unknown cube: {}",
+                table_name
+            )));
+        }
     }
 }
 
 pub fn convert_statement_to_cube_query(
     stmt: &ast::Statement,
-    tenant: &ctx::TenantContext,
-) -> CompilationResult<CompiledQuery> {
-    match stmt {
-        ast::Statement::Query(q) => {
-            match &q.body {
-                sqlparser::ast::SetExpr::Select(select) => {
-                    if !select.cluster_by.is_empty() {
-                        return Err(CompilationError::Unsupported(
-                            "Query with CLUSTER BY instruction(s)".to_string(),
-                        ));
-                    }
-
-                    if q.with.is_some() {
-                        return Err(CompilationError::Unsupported(
-                            "Query with CTE instruction(s)".to_string(),
-                        ));
-                    }
-
-                    if select.having.is_some() {
-                        return Err(CompilationError::Unsupported(
-                            "Query with HAVING instruction(s)".to_string(),
-                        ));
-                    }
-
-                    let from_table = if select.from.len() == 1 {
-                        if !select.from[0].joins.is_empty() {
-                            return Err(CompilationError::Unsupported(
-                                "Query with JOIN instruction(s)".to_string(),
-                            ));
-                        }
-
-                        &select.from[0]
-                    } else {
-                        return Err(CompilationError::Unsupported(
-                            "Query with multiple tables in from".to_string(),
-                        ));
-                    };
-
-                    let table_name = compile_table_factor(&from_table.relation)?;
-
-                    if let Some(cube) = tenant.find_cube_with_name(table_name.clone()) {
-                        // println!("{:?}", select.projection);
-                        let mut ctx = QueryContext::new(&cube);
-                        let mut builder = compile_select(select, &mut ctx)?;
-
-                        if let Some(limit_expr) = &q.limit {
-                            let limit = limit_expr.to_string().parse::<i32>().map_err(|e| {
-                                CompilationError::Unsupported(format!(
-                                    "Unable to parse limit: {}",
-                                    e.to_string()
-                                ))
-                            })?;
-
-                            builder.with_limit(limit);
-                        }
-
-                        if let Some(offset_expr) = &q.offset {
-                            let offset =
-                                offset_expr.value.to_string().parse::<i32>().map_err(|e| {
-                                    CompilationError::Unsupported(format!(
-                                        "Unable to parse offset: {}",
-                                        e.to_string()
-                                    ))
-                                })?;
-
-                            builder.with_offset(offset);
-                        }
-
-                        compile_group(&select.group_by, &ctx, &mut builder)?;
-                        compile_order(&q.order_by, &ctx, &mut builder)?;
-
-                        if let Some(selection) = &select.selection {
-                            compile_where(selection, &ctx, &mut builder)?;
-                        }
-
-                        Ok(builder.build())
-                    } else {
-                        return Err(CompilationError::Unknown(format!(
-                            "Unknown cube: {}",
-                            table_name
-                        )));
-                    }
-                }
-                _ => Err(CompilationError::Unsupported(
-                    "Unsupported Query".to_string(),
-                )),
-            }
-
-            // println!("{:?}", q);
-        }
-        _ => Err(CompilationError::Unsupported("Unsupported AST".to_string())),
-    }
+    tenant: Arc<ctx::TenantContext>,
+) -> CompilationResult<QueryPlan> {
+    let planner = QueryPlanner::new(tenant);
+    planner.plan(stmt)
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -1090,10 +1136,37 @@ pub struct CompiledQuery {
     pub meta: Vec<CompiledQueryFieldMeta>,
 }
 
+#[derive(Debug)]
+pub enum QueryPlan {
+    DataFushionSelect(LogicalPlan),
+    CubeSelect(CompiledQuery),
+}
+
+impl QueryPlan {
+    pub fn print(&self, pretty: bool) -> Result<String, CubeError> {
+        match self {
+            QueryPlan::DataFushionSelect(plan) => {
+                if pretty {
+                    Ok(plan.display_indent().to_string())
+                } else {
+                    Ok(plan.display().to_string())
+                }
+            }
+            QueryPlan::CubeSelect(compiled_query) => {
+                if pretty {
+                    Ok(serde_json::to_string_pretty(&compiled_query)?)
+                } else {
+                    Ok(serde_json::to_string(&compiled_query)?)
+                }
+            }
+        }
+    }
+}
+
 pub fn convert_sql_to_cube_query(
     query: &String,
-    tenant: &ctx::TenantContext,
-) -> CompilationResult<CompiledQuery> {
+    tenant: Arc<ctx::TenantContext>,
+) -> CompilationResult<QueryPlan> {
     let dialect = MySqlDialect {};
     let parse_result = Parser::parse_sql(&dialect, query);
 
@@ -1200,21 +1273,28 @@ mod tests {
         ]
     }
 
-    fn get_test_tenant_ctx() -> ctx::TenantContext {
-        ctx::TenantContext {
+    fn get_test_tenant_ctx() -> Arc<ctx::TenantContext> {
+        Arc::new(ctx::TenantContext {
             cubes: get_test_meta(),
+        })
+    }
+
+    fn convert_simple_select(query: String) -> CompiledQuery {
+        let query = convert_sql_to_cube_query(&query, get_test_tenant_ctx());
+        match query.unwrap() {
+            QueryPlan::CubeSelect(query) => query,
+            _ => panic!("Must return CubeSelect instead of DF plan"),
         }
     }
 
     #[test]
     fn test_select_measure_via_function() {
-        let query = convert_sql_to_cube_query(
-            &"SELECT MEASURE(maxPrice), MEASURE(minPrice), MEASURE(avgPrice) FROM KibanaSampleDataEcommerce".to_string(),
-            &get_test_tenant_ctx(),
+        let query = convert_simple_select(
+            "SELECT MEASURE(maxPrice), MEASURE(minPrice), MEASURE(avgPrice) FROM KibanaSampleDataEcommerce".to_string(),
         );
 
         assert_eq!(
-            query.unwrap(),
+            query,
             CompiledQuery {
                 request: V1LoadRequestQuery {
                     measures: Some(vec![
@@ -1253,14 +1333,13 @@ mod tests {
 
     #[test]
     fn test_select_measure_aggregate_functions() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT MAX(maxPrice), MIN(minPrice), AVG(avgPrice) FROM KibanaSampleDataEcommerce"
                 .to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap(),
+            query,
             CompiledQuery {
                 request: V1LoadRequestQuery {
                     measures: Some(vec![
@@ -1299,13 +1378,12 @@ mod tests {
 
     #[test]
     fn test_order_alias_for_measure_default() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT COUNT(*) as cnt FROM KibanaSampleDataEcommerce ORDER BY cnt".to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec!["KibanaSampleDataEcommerce.count".to_string(),]),
                 segments: Some(vec![]),
@@ -1324,14 +1402,13 @@ mod tests {
 
     #[test]
     fn test_order_alias_for_dimension_default() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT taxful_total_price as total_price FROM KibanaSampleDataEcommerce ORDER BY total_price"
                 .to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1352,14 +1429,13 @@ mod tests {
 
     #[test]
     fn test_order_indentifier_default() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price"
                 .to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1380,13 +1456,12 @@ mod tests {
 
     #[test]
     fn test_order_indentifier_asc() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price ASC".to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1407,13 +1482,12 @@ mod tests {
 
     #[test]
     fn test_order_indentifier_desc() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price DESC".to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1434,13 +1508,11 @@ mod tests {
 
     #[test]
     fn test_select_all_fields_by_asterisk_limit_100() {
-        let query = convert_sql_to_cube_query(
-            &"SELECT * FROM KibanaSampleDataEcommerce LIMIT 100".to_string(),
-            &get_test_tenant_ctx(),
-        );
+        let query =
+            convert_simple_select(&"SELECT * FROM KibanaSampleDataEcommerce LIMIT 100".to_string());
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1460,13 +1532,12 @@ mod tests {
 
     #[test]
     fn test_select_all_fields_by_asterisk_limit_100_offset_50() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT * FROM KibanaSampleDataEcommerce LIMIT 100 OFFSET 50".to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1486,13 +1557,12 @@ mod tests {
 
     #[test]
     fn test_select_two_fields() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT order_date, customer_gender FROM KibanaSampleDataEcommerce".to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap().request,
+            query.request,
             V1LoadRequestQuery {
                 measures: Some(vec![]),
                 segments: Some(vec![]),
@@ -1511,14 +1581,13 @@ mod tests {
 
     #[test]
     fn test_select_fields_alias() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT order_date as order_date, customer_gender as customer_gender FROM KibanaSampleDataEcommerce"
                 .to_string(),
-            &get_test_tenant_ctx(),
         );
 
         assert_eq!(
-            query.unwrap(),
+            query,
             CompiledQuery {
                 request: V1LoadRequestQuery {
                     measures: Some(vec![]),
@@ -1635,9 +1704,9 @@ mod tests {
         ];
 
         for (input_query, expected_query) in variants.iter() {
-            let query = convert_sql_to_cube_query(&input_query, &get_test_tenant_ctx());
+            let query = convert_simple_select(&input_query);
 
-            assert_eq!(&query.unwrap(), expected_query)
+            assert_eq!(&query, expected_query)
         }
     }
 
@@ -1672,7 +1741,7 @@ mod tests {
         ];
 
         for (input_query, expected_error) in variants.iter() {
-            let query = convert_sql_to_cube_query(&input_query, &get_test_tenant_ctx());
+            let query = convert_sql_to_cube_query(&input_query, get_test_tenant_ctx());
 
             match &query {
                 Ok(_) => panic!("Query ({}) should return error", input_query),
@@ -1704,13 +1773,12 @@ mod tests {
         ];
 
         for [subquery, expected_granularity] in supported_granularities.iter() {
-            let query = convert_sql_to_cube_query(
-                &format!("SELECT COUNT(*), {} AS __timestamp FROM KibanaSampleDataEcommerce GROUP BY __timestamp", subquery),
-                &get_test_tenant_ctx(),
+            let query = convert_simple_select(
+                &format!("SELECT COUNT(*), {} AS __timestamp FROM KibanaSampleDataEcommerce GROUP BY __timestamp", subquery)
             );
 
             assert_eq!(
-                query.unwrap(),
+                query,
                 CompiledQuery {
                     request: V1LoadRequestQuery {
                         measures: Some(vec!["KibanaSampleDataEcommerce.count".to_string(),]),
@@ -1745,17 +1813,16 @@ mod tests {
 
     #[test]
     fn test_where_filter_daterange() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
                 WHERE order_date >= STR_TO_DATE('2021-08-31 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f') AND order_date < STR_TO_DATE('2021-09-07 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f')
                 GROUP BY __timestamp"
             .to_string(),
-            &get_test_tenant_ctx(),
         );
 
-        let req = query.unwrap().request;
+        let req = query.request;
 
         assert_eq!(
             req.time_dimensions,
@@ -1774,18 +1841,17 @@ mod tests {
 
     #[test]
     fn test_where_filter_or() {
-        let query = convert_sql_to_cube_query(
+        let query = convert_simple_select(
             &"SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
                 WHERE order_date >= STR_TO_DATE('2021-08-31 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f') OR order_date < STR_TO_DATE('2021-09-07 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f')
                 GROUP BY __timestamp"
-            .to_string(),
-            &get_test_tenant_ctx(),
+            .to_string()
         );
 
         assert_eq!(
-            query.unwrap().request.filters,
+            query.request.filters,
             Some(vec![V1LoadRequestQueryFilterItem {
                 member: None,
                 operator: None,
@@ -1939,19 +2005,16 @@ mod tests {
         ];
 
         for (sql, expected_fitler) in to_check.iter() {
-            let query = convert_sql_to_cube_query(
-                &format!(
-                    "SELECT 
+            let query = convert_simple_select(&format!(
+                "SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
                 WHERE {}
                 GROUP BY __timestamp",
-                    sql
-                ),
-                &get_test_tenant_ctx(),
-            );
+                sql
+            ));
 
-            assert_eq!(query.unwrap().request.filters, *expected_fitler)
+            assert_eq!(query.request.filters, *expected_fitler)
         }
     }
 
@@ -2150,22 +2213,16 @@ mod tests {
         ];
 
         for (sql, expected_fitler) in to_check.iter() {
-            let query = convert_sql_to_cube_query(
-                &format!(
-                    "SELECT 
+            let query = convert_simple_select(&format!(
+                "SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
                 WHERE {}
                 GROUP BY __timestamp",
-                    sql
-                ),
-                &get_test_tenant_ctx(),
-            );
+                sql
+            ));
 
-            assert_eq!(
-                query.unwrap().request.filters,
-                Some(expected_fitler.clone())
-            )
+            assert_eq!(query.request.filters, Some(expected_fitler.clone()))
         }
     }
 
