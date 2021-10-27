@@ -210,6 +210,10 @@ impl Backend {
         let ignore = match query_lower.as_str() {
             "set names utf8mb4" => true,
             "set names latin1" => true,
+            "set character_set_results = utf8" => true,
+            "set character_set_results = latin1" => true,
+            "set autocommit=1" => true,
+            "set sql_mode='strict_trans_tables'" => true,
             "rollback" => true,
             "commit" => true,
             _ => false,
