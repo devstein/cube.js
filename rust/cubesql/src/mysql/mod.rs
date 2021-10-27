@@ -28,13 +28,13 @@ use log::trace;
 
 use msql_srv::*;
 
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, RwLock};
 
 use crate::compile::convert_sql_to_cube_query;
 use crate::compile::convert_statement_to_cube_query;
+use crate::compile::parser::MySqlDialectWithBackTicks;
 use crate::config::processing_loop::ProcessingLoop;
 use crate::schema::SchemaService;
 use crate::schema::V1CubeMetaExt;
@@ -413,7 +413,7 @@ impl Backend {
                 ),
             )
         } else if query_lower.starts_with("describe") || query_lower.starts_with("explain") {
-            let dialect = MySqlDialect {};
+            let dialect = MySqlDialectWithBackTicks {};
             let parse_result = Parser::parse_sql(&dialect, &query)?;
 
             let query = &parse_result[0];
@@ -514,7 +514,7 @@ impl Backend {
                 }
             }
         } else if query_lower.starts_with("show create table") {
-            let dialect = MySqlDialect {};
+            let dialect = MySqlDialectWithBackTicks {};
             let parse_result = Parser::parse_sql(&dialect, &query)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 

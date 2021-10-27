@@ -10,13 +10,13 @@ use log::{debug, trace};
 use serde::Serialize;
 use serde_json::json;
 use sqlparser::ast;
-use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use cubeclient::models::{
     V1LoadRequestQuery, V1LoadRequestQueryFilterItem, V1LoadRequestQueryTimeDimension,
 };
 
+use crate::compile::parser::MySqlDialectWithBackTicks;
 pub use crate::schema::ctx::*;
 use crate::CubeError;
 use crate::{
@@ -30,7 +30,7 @@ use self::context::*;
 
 pub mod builder;
 pub mod context;
-mod parser;
+pub mod parser;
 
 #[derive(Debug, PartialEq)]
 pub enum CompilationError {
@@ -1174,7 +1174,7 @@ pub fn convert_sql_to_cube_query(
     query: &String,
     tenant: Arc<ctx::TenantContext>,
 ) -> CompilationResult<QueryPlan> {
-    let dialect = MySqlDialect {};
+    let dialect = MySqlDialectWithBackTicks {};
     let parse_result = Parser::parse_sql(&dialect, query);
 
     match parse_result {
