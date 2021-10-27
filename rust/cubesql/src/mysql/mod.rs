@@ -28,7 +28,6 @@ use log::trace;
 
 use msql_srv::*;
 
-
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use tokio::net::TcpListener;

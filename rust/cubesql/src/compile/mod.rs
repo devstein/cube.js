@@ -3,7 +3,8 @@ use std::{backtrace::Backtrace, fmt};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
-
+use datafusion::sql::parser::Statement as DFStatement;
+use datafusion::sql::planner::SqlToRel;
 use datafusion::{logical_plan::LogicalPlan, prelude::*};
 use log::{debug, trace};
 use serde::Serialize;
@@ -979,7 +980,7 @@ impl QueryPlanner {
     }
 
     pub fn plan(&self, stmt: &ast::Statement) -> CompilationResult<QueryPlan> {
-        match stmt {
+        let (query, select) = match stmt {
             ast::Statement::Query(q) => {
                 if q.with.is_some() {
                     return Err(CompilationError::Unsupported(
@@ -988,23 +989,21 @@ impl QueryPlanner {
                 }
 
                 match &q.body {
-                    sqlparser::ast::SetExpr::Select(select) => self.plan_select(q, select),
-                    _ => Err(CompilationError::Unsupported(
-                        "Unsupported Query".to_string(),
-                    )),
+                    sqlparser::ast::SetExpr::Select(select) => (q, select),
+                    _ => {
+                        return Err(CompilationError::Unsupported(
+                            "Unsupported Query".to_string(),
+                        ));
+                    }
                 }
             }
-            _ => Err(CompilationError::Unsupported(
-                "Unsupported query type".to_string(),
-            )),
-        }
-    }
+            _ => {
+                return Err(CompilationError::Unsupported(
+                    "Unsupported query type".to_string(),
+                ));
+            }
+        };
 
-    fn plan_select(
-        &self,
-        q: &Box<ast::Query>,
-        select: &Box<ast::Select>,
-    ) -> CompilationResult<QueryPlan> {
         if !select.cluster_by.is_empty() {
             return Err(CompilationError::Unsupported(
                 "Query with CLUSTER BY instruction(s)".to_string(),
@@ -1032,16 +1031,7 @@ impl QueryPlanner {
 
             &select.from[0]
         } else {
-            let ctx = ExecutionContext::new();
-            let plan = ctx.create_logical_plan(&q.to_string()).map_err(|err| {
-                CompilationError::Internal(format!("Initial planning error: {}", err))
-            })?;
-
-            let optimized_plan = ctx.optimize(&plan).map_err(|err| {
-                CompilationError::Internal(format!("Planning optimization error: {}", err))
-            })?;
-
-            return Ok(QueryPlan::DataFushionSelect(optimized_plan));
+            return self.create_df_logical_plan(stmt.clone());
         };
 
         let (schema_name, table_name) = match &from_table.relation {
@@ -1054,12 +1044,9 @@ impl QueryPlanner {
                         // `KibanaSampleDataEcommerce`
                         ("db".to_string(), identifiers[0].value.clone())
                     } else {
-                        let ctx = ExecutionContext::new();
-                        let plan = ctx.create_logical_plan(&q.to_string()).map_err(|err| {
-                            CompilationError::Internal(format!("Planning error: {}", err))
-                        })?;
-
-                        return Ok(QueryPlan::DataFushionSelect(plan));
+                        return Err(CompilationError::Unsupported(
+                            "Query with multiple tables in from".to_string(),
+                        ));
                     }
                 }
             },
@@ -1083,7 +1070,7 @@ impl QueryPlanner {
             let mut ctx = QueryContext::new(&cube);
             let mut builder = compile_select(select, &mut ctx)?;
 
-            if let Some(limit_expr) = &q.limit {
+            if let Some(limit_expr) = &query.limit {
                 let limit = limit_expr.to_string().parse::<i32>().map_err(|e| {
                     CompilationError::Unsupported(format!(
                         "Unable to parse limit: {}",
@@ -1094,7 +1081,7 @@ impl QueryPlanner {
                 builder.with_limit(limit);
             }
 
-            if let Some(offset_expr) = &q.offset {
+            if let Some(offset_expr) = &query.offset {
                 let offset = offset_expr.value.to_string().parse::<i32>().map_err(|e| {
                     CompilationError::Unsupported(format!(
                         "Unable to parse offset: {}",
@@ -1106,7 +1093,7 @@ impl QueryPlanner {
             }
 
             compile_group(&select.group_by, &ctx, &mut builder)?;
-            compile_order(&q.order_by, &ctx, &mut builder)?;
+            compile_order(&query.order_by, &ctx, &mut builder)?;
 
             if let Some(selection) = &select.selection {
                 compile_where(selection, &ctx, &mut builder)?;
@@ -1119,6 +1106,25 @@ impl QueryPlanner {
                 table_name
             )));
         }
+    }
+
+    fn create_df_logical_plan(&self, stmt: ast::Statement) -> CompilationResult<QueryPlan> {
+        let ctx = ExecutionContext::new();
+
+        let state = ctx.state.lock().unwrap().clone();
+        let df_query_planner = SqlToRel::new(&state);
+
+        let plan = df_query_planner
+            .statement_to_plan(&DFStatement::Statement(stmt))
+            .map_err(|err| {
+                CompilationError::Internal(format!("Initial planning error: {}", err))
+            })?;
+
+        let optimized_plan = ctx.optimize(&plan).map_err(|err| {
+            CompilationError::Internal(format!("Planning optimization error: {}", err))
+        })?;
+
+        return Ok(QueryPlan::DataFushionSelect(optimized_plan));
     }
 }
 
