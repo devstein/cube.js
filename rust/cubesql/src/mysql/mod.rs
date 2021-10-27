@@ -194,6 +194,7 @@ impl Backend {
         query: &'a str,
     ) -> Result<Arc<dataframe::DataFrame>, CubeError> {
         let _start = SystemTime::now();
+
         trace!("RAW QUERY: {}", query);
         let query = str::replace(query, "\n", " ");
         let query = query.replace("SELECT FROM", "SELECT * FROM");

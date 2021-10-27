@@ -30,6 +30,7 @@ use self::context::*;
 
 pub mod builder;
 pub mod context;
+mod parser;
 
 #[derive(Debug, PartialEq)]
 pub enum CompilationError {
@@ -2233,8 +2234,9 @@ mod tests {
     }
 
     fn parse_expr_from_projection(query: &str) -> ast::Expr {
-        let dialect = MySqlDialect {};
-        let parse_result = Parser::parse_sql(&dialect, &query).unwrap();
+        let dialect = parser::MySqlDialectWithBackTicks {};
+        let replaced_quote = query.replace("\\'", "''");
+        let parse_result = Parser::parse_sql(&dialect, &replaced_quote).unwrap();
 
         let query = &parse_result[0];
 
