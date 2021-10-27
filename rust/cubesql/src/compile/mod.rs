@@ -1334,7 +1334,7 @@ mod tests {
     #[test]
     fn test_select_measure_aggregate_functions() {
         let query = convert_simple_select(
-            &"SELECT MAX(maxPrice), MIN(minPrice), AVG(avgPrice) FROM KibanaSampleDataEcommerce"
+            "SELECT MAX(maxPrice), MIN(minPrice), AVG(avgPrice) FROM KibanaSampleDataEcommerce"
                 .to_string(),
         );
 
@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn test_order_alias_for_measure_default() {
         let query = convert_simple_select(
-            &"SELECT COUNT(*) as cnt FROM KibanaSampleDataEcommerce ORDER BY cnt".to_string(),
+            "SELECT COUNT(*) as cnt FROM KibanaSampleDataEcommerce ORDER BY cnt".to_string(),
         );
 
         assert_eq!(
@@ -1403,7 +1403,7 @@ mod tests {
     #[test]
     fn test_order_alias_for_dimension_default() {
         let query = convert_simple_select(
-            &"SELECT taxful_total_price as total_price FROM KibanaSampleDataEcommerce ORDER BY total_price"
+            "SELECT taxful_total_price as total_price FROM KibanaSampleDataEcommerce ORDER BY total_price"
                 .to_string(),
         );
 
@@ -1430,7 +1430,7 @@ mod tests {
     #[test]
     fn test_order_indentifier_default() {
         let query = convert_simple_select(
-            &"SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price"
+            "SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price"
                 .to_string(),
         );
 
@@ -1457,7 +1457,7 @@ mod tests {
     #[test]
     fn test_order_indentifier_asc() {
         let query = convert_simple_select(
-            &"SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price ASC".to_string(),
+            "SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price ASC".to_string(),
         );
 
         assert_eq!(
@@ -1483,7 +1483,7 @@ mod tests {
     #[test]
     fn test_order_indentifier_desc() {
         let query = convert_simple_select(
-            &"SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price DESC".to_string(),
+            "SELECT taxful_total_price FROM KibanaSampleDataEcommerce ORDER BY taxful_total_price DESC".to_string(),
         );
 
         assert_eq!(
@@ -1509,7 +1509,7 @@ mod tests {
     #[test]
     fn test_select_all_fields_by_asterisk_limit_100() {
         let query =
-            convert_simple_select(&"SELECT * FROM KibanaSampleDataEcommerce LIMIT 100".to_string());
+            convert_simple_select("SELECT * FROM KibanaSampleDataEcommerce LIMIT 100".to_string());
 
         assert_eq!(
             query.request,
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn test_select_all_fields_by_asterisk_limit_100_offset_50() {
         let query = convert_simple_select(
-            &"SELECT * FROM KibanaSampleDataEcommerce LIMIT 100 OFFSET 50".to_string(),
+            "SELECT * FROM KibanaSampleDataEcommerce LIMIT 100 OFFSET 50".to_string(),
         );
 
         assert_eq!(
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn test_select_two_fields() {
         let query = convert_simple_select(
-            &"SELECT order_date, customer_gender FROM KibanaSampleDataEcommerce".to_string(),
+            "SELECT order_date, customer_gender FROM KibanaSampleDataEcommerce".to_string(),
         );
 
         assert_eq!(
@@ -1582,7 +1582,7 @@ mod tests {
     #[test]
     fn test_select_fields_alias() {
         let query = convert_simple_select(
-            &"SELECT order_date as order_date, customer_gender as customer_gender FROM KibanaSampleDataEcommerce"
+            "SELECT order_date as order_date, customer_gender as customer_gender FROM KibanaSampleDataEcommerce"
                 .to_string(),
         );
 
@@ -1704,7 +1704,7 @@ mod tests {
         ];
 
         for (input_query, expected_query) in variants.iter() {
-            let query = convert_simple_select(&input_query);
+            let query = convert_simple_select(input_query.clone());
 
             assert_eq!(&query, expected_query)
         }
@@ -1774,7 +1774,7 @@ mod tests {
 
         for [subquery, expected_granularity] in supported_granularities.iter() {
             let query = convert_simple_select(
-                &format!("SELECT COUNT(*), {} AS __timestamp FROM KibanaSampleDataEcommerce GROUP BY __timestamp", subquery)
+                format!("SELECT COUNT(*), {} AS __timestamp FROM KibanaSampleDataEcommerce GROUP BY __timestamp", subquery)
             );
 
             assert_eq!(
@@ -1814,7 +1814,7 @@ mod tests {
     #[test]
     fn test_where_filter_daterange() {
         let query = convert_simple_select(
-            &"SELECT 
+            "SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
                 WHERE order_date >= STR_TO_DATE('2021-08-31 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f') AND order_date < STR_TO_DATE('2021-09-07 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f')
@@ -1842,7 +1842,7 @@ mod tests {
     #[test]
     fn test_where_filter_or() {
         let query = convert_simple_select(
-            &"SELECT 
+            "SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
                 WHERE order_date >= STR_TO_DATE('2021-08-31 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f') OR order_date < STR_TO_DATE('2021-09-07 00:00:00.000000', '%Y-%m-%d %H:%i:%s.%f')
@@ -2005,7 +2005,7 @@ mod tests {
         ];
 
         for (sql, expected_fitler) in to_check.iter() {
-            let query = convert_simple_select(&format!(
+            let query = convert_simple_select(format!(
                 "SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
@@ -2213,7 +2213,7 @@ mod tests {
         ];
 
         for (sql, expected_fitler) in to_check.iter() {
-            let query = convert_simple_select(&format!(
+            let query = convert_simple_select(format!(
                 "SELECT 
                 COUNT(*), DATE(order_date) AS __timestamp
                 FROM KibanaSampleDataEcommerce
