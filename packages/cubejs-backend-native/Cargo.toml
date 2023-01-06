@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 cubesql = { path = "../../rust/cubesql" }
 cubeclient = { path = "../../rust/cubeclient" }
-tokio = { version = "1.0", features = ["full", "rt"] }
+tokio = { version = "1.16", features = ["full", "rt"] }
 async-trait = "0.1.36"
 serde_derive = "1.0.115"
 serde = "1.0.115"
